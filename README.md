@@ -77,8 +77,12 @@ MONITOR_INTERVAL_SECONDS=60
 SIGNAL_COOLDOWN_MINUTES=45
 DEFAULT_MODE=trader
 AUTO_REPORT_ENABLED=true
+AUTO_REPORT_MODE=candle
 AUTO_REPORT_INTERVAL_MINUTES=60
 AUTO_REPORT_START_DELAY_SECONDS=90
+TRADER_CANDLE_MINUTES=15
+INVESTOR_CANDLE_MINUTES=60
+CANDLE_REPORT_DELAY_SECONDS=20
 TICKER_CACHE_SECONDS=120
 CANDLE_CACHE_MINUTES=15
 BINANCE_RESTRICTED_COOLDOWN_MINUTES=360
@@ -94,13 +98,17 @@ Keterangan:
 - `SIGNAL_COOLDOWN_MINUTES` mencegah alert berulang untuk koin dan arah sinyal yang sama.
 - `DEFAULT_MODE` bisa `trader` atau `investor`.
 - `AUTO_REPORT_ENABLED=true` membuat bot mengirim laporan otomatis setelah online.
-- `AUTO_REPORT_INTERVAL_MINUTES` mengatur jarak laporan otomatis. Minimal 15 menit agar WhatsApp dan API tidak mudah limit.
+- `AUTO_REPORT_MODE` bisa `candle`, `interval`, atau `both`. Default `candle`.
+- `TRADER_CANDLE_MINUTES=15` membuat laporan trader dikirim setelah candle 15 menit close.
+- `INVESTOR_CANDLE_MINUTES=60` membuat laporan investor dikirim setelah candle 1 jam close.
+- `CANDLE_REPORT_DELAY_SECONDS=20` memberi jeda setelah candle close agar data market sudah update.
+- `AUTO_REPORT_INTERVAL_MINUTES` hanya dipakai jika `AUTO_REPORT_MODE=interval` atau `both`.
 - `AUTO_REPORT_START_DELAY_SECONDS` mengatur jeda laporan pertama setelah bot online.
 - `TICKER_CACHE_SECONDS` dan `CANDLE_CACHE_MINUTES` menjaga bot tidak terlalu sering memukul API gratis.
 - `BINANCE_RESTRICTED_COOLDOWN_MINUTES` membuat bot berhenti sementara mencoba Binance jika server terkena blokir lokasi `451`.
 - `COINGECKO_RATE_COOLDOWN_MINUTES` membuat bot memakai cache dulu saat CoinGecko membalas `429`.
 
-Monitor otomatis mengecek 1 koin per siklus. Dengan watchlist 5 koin dan interval 60 detik, semua koin akan diputar sekitar 5 menit sekali. Ini lebih stabil untuk hosting gratis dan API gratis.
+Monitor otomatis mengecek 1 koin per siklus. Dengan watchlist 5 koin dan interval 60 detik, semua koin akan diputar sekitar 5 menit sekali. Laporan otomatis default mengikuti pergantian candle: trader 15m dan investor 1h.
 
 ## Cara Menjalankan Lokal
 
