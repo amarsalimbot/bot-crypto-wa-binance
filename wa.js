@@ -22,8 +22,14 @@ const MARKET_DATA_PROVIDER = ["auto", "binance", "coingecko"].includes(String(pr
     ? String(process.env.MARKET_DATA_PROVIDER || "coingecko").toLowerCase()
     : "coingecko";
 const AUTO_REPORT_ENABLED = String(process.env.AUTO_REPORT_ENABLED || "true").toLowerCase() !== "false";
+const AUTO_REPORT_MODE = ["candle", "interval", "both"].includes(String(process.env.AUTO_REPORT_MODE || "candle").toLowerCase())
+    ? String(process.env.AUTO_REPORT_MODE || "candle").toLowerCase()
+    : "candle";
 const AUTO_REPORT_INTERVAL_MINUTES = Math.max(15, Number(process.env.AUTO_REPORT_INTERVAL_MINUTES || 60));
 const AUTO_REPORT_START_DELAY_SECONDS = Math.max(30, Number(process.env.AUTO_REPORT_START_DELAY_SECONDS || 90));
+const TRADER_CANDLE_MINUTES = Math.max(5, Number(process.env.TRADER_CANDLE_MINUTES || 15));
+const INVESTOR_CANDLE_MINUTES = Math.max(15, Number(process.env.INVESTOR_CANDLE_MINUTES || 60));
+const CANDLE_REPORT_DELAY_SECONDS = Math.max(5, Number(process.env.CANDLE_REPORT_DELAY_SECONDS || 20));
 const BINANCE_RESTRICTED_COOLDOWN_MINUTES = Math.max(30, Number(process.env.BINANCE_RESTRICTED_COOLDOWN_MINUTES || 360));
 const COINGECKO_RATE_COOLDOWN_MINUTES = Math.max(2, Number(process.env.COINGECKO_RATE_COOLDOWN_MINUTES || 10));
 const TICKER_CACHE_MS = Math.max(30_000, Number(process.env.TICKER_CACHE_SECONDS || 120) * 1000);
@@ -55,6 +61,7 @@ let jumlahReconnect = 0;
 let monitorTimer = null;
 let autoReportTimer = null;
 let autoReportStartupTimer = null;
+let candleReportTimers = { trader: null, investor: null };
 let monitorCursor = 0;
 let monitorSedangBerjalan = false;
 let autoReportSedangBerjalan = false;
@@ -203,6 +210,32 @@ function bolehPakaiBinance() {
     if (MARKET_DATA_PROVIDER === "coingecko") return false;
     if (MARKET_DATA_PROVIDER === "binance") return true;
     return Date.now() >= binanceBlockedUntil;
+}
+
+function candleMinutesForMode(mode) {
+    return mode === "investor" ? INVESTOR_CANDLE_MINUTES : TRADER_CANDLE_MINUTES;
+}
+
+function timeframeLabel(mode) {
+    const minutes = candleMinutesForMode(mode);
+    if (minutes % 60 === 0) return `${minutes / 60}H`;
+    return `${minutes}M`;
+}
+
+function msUntilNextCandle(minutes) {
+    const now = Date.now();
+    const frameMs = minutes * 60 * 1000;
+    const next = Math.ceil(now / frameMs) * frameMs;
+    return Math.max(1000, next - now + CANDLE_REPORT_DELAY_SECONDS * 1000);
+}
+
+function getRecipientsForMode(mode) {
+    const ids = Object.entries(state.subscribers)
+        .filter(([, config]) => config.active && (config.mode || DEFAULT_MODE) === mode)
+        .map(([jid]) => jid);
+
+    if (OWNER_JID && !ids.includes(OWNER_JID)) ids.push(OWNER_JID);
+    return ids;
 }
 
 async function fetchJson(url, timeoutMs = 15000) {
@@ -647,12 +680,59 @@ function buildPriceMessage(rows) {
     return text.trim();
 }
 
+function buildTradePlan(result) {
+    const { ticker, signal, mode } = result;
+    const price = ticker.price;
+    const i = signal.indicators;
+    const volPct = Math.max(0.35, Math.min(3.5, Number(i.volatility || 1)));
+    const support = Number(i.support || price * 0.985);
+    const resistance = Number(i.resistance || price * 1.015);
+    const digits = price >= 100 ? 2 : 4;
+    const stopBuffer = mode === "investor" ? 1.2 : 0.55;
+    const targetBuffer = mode === "investor" ? 1.6 : 0.75;
+
+    const entryLow = Math.min(price, support * (1 + volPct / 350));
+    const entryHigh = signal.action === "ENTRY"
+        ? price * (1 + volPct / 450)
+        : Math.min(resistance * 1.002, price * (1 + volPct / 300));
+    const stopLoss = Math.min(support * (1 - stopBuffer / 100), price * (1 - (volPct + stopBuffer) / 100));
+    const takeProfit1 = Math.max(resistance, price * (1 + (volPct + targetBuffer) / 100));
+    const takeProfit2 = takeProfit1 * (1 + (mode === "investor" ? 2.2 : 1.1) / 100);
+    const sellNowArea = price * (1 - volPct / 500);
+
+    if (signal.action === "ENTRY") {
+        return {
+            entry: `boleh cicil entry di ${formatUsd(entryLow, digits)} - ${formatUsd(entryHigh, digits)}`,
+            sell: `TP1 ${formatUsd(takeProfit1, digits)}, TP2 ${formatUsd(takeProfit2, digits)}`,
+            stop: `SL jika close di bawah ${formatUsd(stopLoss, digits)}`,
+            note: "entry bertahap, jangan all-in"
+        };
+    }
+
+    if (signal.action === "SELL") {
+        return {
+            entry: `tunggu pullback ke ${formatUsd(support, digits)} atau breakout ulang ${formatUsd(resistance, digits)}`,
+            sell: `kurangi posisi / take profit area ${formatUsd(sellNowArea, digits)} - ${formatUsd(price, digits)}`,
+            stop: `hindari entry baru selama harga di bawah ${formatUsd(resistance, digits)}`,
+            note: "prioritas amankan modal dan profit"
+        };
+    }
+
+    return {
+        entry: `tunggu konfirmasi breakout di atas ${formatUsd(resistance, digits)} atau pantulan support ${formatUsd(support, digits)}`,
+        sell: `sell/take profit jika gagal tembus ${formatUsd(resistance, digits)} atau close di bawah ${formatUsd(support, digits)}`,
+        stop: `SL rencana di bawah ${formatUsd(stopLoss, digits)}`,
+        note: "WAIT, belum ada rasio risk/reward yang bersih"
+    };
+}
+
 function buildAnalysisMessage(result) {
     const { asset, name, ticker, signal, mode } = result;
     const digits = ticker.price >= 100 ? 2 : 4;
     const label = signal.action === "ENTRY" ? "ENTRY / BUY" : signal.action === "SELL" ? "SELL / TAKE PROFIT / RISK OFF" : "WAIT";
     const reasons = signal.reasons.slice(0, 5).map(reason => `- ${reason}`).join("\n");
     const i = signal.indicators;
+    const plan = buildTradePlan(result);
 
     return `${asset} (${name}) - ${mode.toUpperCase()}
 Harga: ${formatUsd(ticker.price, digits)} (${formatPct(ticker.changePct)} 24j)
@@ -671,6 +751,12 @@ Resistance: ${formatUsd(i.resistance, digits)}
 RSI 15m: ${i.rsi == null ? "-" : i.rsi.toFixed(1)}
 Volume: ${i.volumeRatio.toFixed(2)}x rata-rata
 Volatilitas 15m: ${i.volatility.toFixed(2)}%
+
+Rencana:
+Entry: ${plan.entry}
+Sell/TP: ${plan.sell}
+Stop: ${plan.stop}
+Catatan: ${plan.note}
 
 Catatan: ini analisis probabilitas, bukan nasihat keuangan. Gunakan risk management.`;
 }
@@ -742,11 +828,13 @@ async function buildAutoMarketReport(mode = DEFAULT_MODE) {
         await sleep(700);
     }
 
-    let text = `🚨 *AUTO MARKET REPORT*\n`;
+    const tfLabel = timeframeLabel(mode);
+    let text = `🚨 *AUTO CANDLE REPORT ${tfLabel}*\n`;
     text += `⏰ ${nowText()}\n`;
     text += `⚙️ Mode: *${mode.toUpperCase()}*\n`;
+    text += `🕯️ Candle: *${tfLabel}* | dikirim setelah candle close\n`;
     text += `📡 Provider: ${MARKET_DATA_PROVIDER.toUpperCase()} | sumber aktual mengikuti data tersedia\n\n`;
-    text += `📊 *Arah Kemungkinan Koin*\n`;
+    text += `📊 *Arah, Entry, dan Sell Plan*\n`;
 
     for (const row of analyses) {
         if (row.error) {
@@ -756,11 +844,14 @@ async function buildAutoMarketReport(mode = DEFAULT_MODE) {
 
         const digits = row.ticker.price >= 100 ? 2 : 4;
         const { signal } = row;
+        const plan = buildTradePlan(row);
         text += `\n${signalEmoji(signal.action)} *${row.asset}* ${formatUsd(row.ticker.price, digits)} (${formatPct(row.ticker.changePct)})`;
         text += `\n   Arah: *${directionText(signal)}*`;
         text += `\n   Sinyal: *${signal.action}* | Confidence ${signal.score}/100`;
-        text += `\n   Teknis: ${compactReasons(signal.reasons)}`;
-        text += `\n   Support/Resist: ${formatUsd(signal.indicators.support, digits)} / ${formatUsd(signal.indicators.resistance, digits)}`;
+        text += `\n   🎯 Entry: ${plan.entry}`;
+        text += `\n   💰 Sell/TP: ${plan.sell}`;
+        text += `\n   🛑 Stop: ${plan.stop}`;
+        text += `\n   📌 Teknis: ${compactReasons(signal.reasons)}`;
     }
 
     text += `\n\n${await buildFundamentalBrief()}`;
@@ -901,7 +992,7 @@ Fitur:
 - harga realtime dari provider market yang dipilih
 - sinyal ENTRY, SELL, atau WAIT
 - monitor otomatis setiap ${MONITOR_INTERVAL_SECONDS} detik, rotasi 1 koin per siklus
-- laporan otomatis setiap ${AUTO_REPORT_INTERVAL_MINUTES} menit
+- laporan otomatis berbasis candle: trader ${timeframeLabel("trader")}, investor ${timeframeLabel("investor")}
 - alert otomatis saat sinyal kuat muncul
 - analisis berita internet via RSS dan Gemini
 - mode trader lebih agresif, mode investor lebih selektif
@@ -943,6 +1034,49 @@ async function sendAutomaticReport(alasan = "jadwal") {
     }
 }
 
+async function sendCandleReport(mode, alasan = "candle close") {
+    if (autoReportSedangBerjalan) {
+        setTimeout(() => {
+            sendCandleReport(mode, "retry setelah report lain selesai").catch(err => console.log(`Retry candle report ${mode} error:`, err.message));
+        }, 60 * 1000);
+        return;
+    }
+    if (!AUTO_REPORT_ENABLED || !sockGlobal) return;
+
+    const recipients = getRecipientsForMode(mode);
+    if (!recipients.length) return;
+
+    autoReportSedangBerjalan = true;
+    try {
+        console.log(`Mengirim candle report ${mode} ${timeframeLabel(mode)} (${alasan}) ke ${recipients.length} penerima.`);
+        const report = await buildAutoMarketReport(mode);
+        for (const jid of recipients) {
+            await sendSafe(jid, report);
+            await sleep(1000);
+        }
+    } catch (err) {
+        console.log(`Candle report ${mode} gagal: ${pendekkanError(err.message)}`);
+    } finally {
+        autoReportSedangBerjalan = false;
+    }
+}
+
+function scheduleNextCandleReport(mode) {
+    if (!AUTO_REPORT_ENABLED || !["candle", "both"].includes(AUTO_REPORT_MODE)) return;
+
+    if (candleReportTimers[mode]) clearTimeout(candleReportTimers[mode]);
+
+    const minutes = candleMinutesForMode(mode);
+    const delay = msUntilNextCandle(minutes);
+
+    candleReportTimers[mode] = setTimeout(async () => {
+        await sendCandleReport(mode, "candle close");
+        scheduleNextCandleReport(mode);
+    }, delay);
+
+    console.log(`Candle report ${mode} aktif. Berikutnya sekitar ${(delay / 60000).toFixed(1)} menit lagi.`);
+}
+
 function startAutomaticReports() {
     if (!AUTO_REPORT_ENABLED) {
         console.log("Auto market report nonaktif via AUTO_REPORT_ENABLED=false.");
@@ -951,16 +1085,27 @@ function startAutomaticReports() {
 
     if (autoReportTimer) clearInterval(autoReportTimer);
     if (autoReportStartupTimer) clearTimeout(autoReportStartupTimer);
+    for (const mode of ["trader", "investor"]) {
+        if (candleReportTimers[mode]) clearTimeout(candleReportTimers[mode]);
+        candleReportTimers[mode] = null;
+    }
 
     autoReportStartupTimer = setTimeout(() => {
         sendAutomaticReport("startup").catch(err => console.log("Auto report startup error:", err.message));
     }, AUTO_REPORT_START_DELAY_SECONDS * 1000);
 
-    autoReportTimer = setInterval(() => {
-        sendAutomaticReport("jadwal").catch(err => console.log("Auto report interval error:", err.message));
-    }, AUTO_REPORT_INTERVAL_MINUTES * 60 * 1000);
+    if (["interval", "both"].includes(AUTO_REPORT_MODE)) {
+        autoReportTimer = setInterval(() => {
+            sendAutomaticReport("jadwal interval").catch(err => console.log("Auto report interval error:", err.message));
+        }, AUTO_REPORT_INTERVAL_MINUTES * 60 * 1000);
+    }
 
-    console.log(`Auto market report aktif setiap ${AUTO_REPORT_INTERVAL_MINUTES} menit.`);
+    if (["candle", "both"].includes(AUTO_REPORT_MODE)) {
+        scheduleNextCandleReport("trader");
+        scheduleNextCandleReport("investor");
+    }
+
+    console.log(`Auto report aktif. Mode jadwal: ${AUTO_REPORT_MODE}.`);
 }
 
 function canSendAlert(jid, asset, action) {
@@ -1041,7 +1186,10 @@ function startKeepAliveServer() {
                 reconnect: jumlahReconnect,
                 monitor_interval_seconds: MONITOR_INTERVAL_SECONDS,
                 auto_report_enabled: AUTO_REPORT_ENABLED,
+                auto_report_mode: AUTO_REPORT_MODE,
                 auto_report_interval_minutes: AUTO_REPORT_INTERVAL_MINUTES,
+                trader_candle_minutes: TRADER_CANDLE_MINUTES,
+                investor_candle_minutes: INVESTOR_CANDLE_MINUTES,
                 time: nowText()
             }));
             return;
@@ -1161,7 +1309,9 @@ Mode: ${subscriberMode(from).toUpperCase()}
 Watchlist: ${WATCHLIST.map(item => item.asset).join(", ")}
 Provider market: ${MARKET_DATA_PROVIDER.toUpperCase()}
 Interval monitor: ${MONITOR_INTERVAL_SECONDS} detik, rotasi 1 koin
-Laporan otomatis: ${AUTO_REPORT_ENABLED ? `${AUTO_REPORT_INTERVAL_MINUTES} menit` : "OFF"}
+Laporan otomatis: ${AUTO_REPORT_ENABLED ? AUTO_REPORT_MODE.toUpperCase() : "OFF"}
+Candle trader: ${timeframeLabel("trader")}
+Candle investor: ${timeframeLabel("investor")}
 Cooldown alert: ${SIGNAL_COOLDOWN_MINUTES} menit
 Binance: ${cooldownText(binanceBlockedUntil)}
 CoinGecko: ${cooldownText(coingeckoRateLimitedUntil)}
