@@ -18,6 +18,10 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const MONITOR_INTERVAL_SECONDS = Math.max(30, Number(process.env.MONITOR_INTERVAL_SECONDS || 60));
 const SIGNAL_COOLDOWN_MINUTES = Math.max(5, Number(process.env.SIGNAL_COOLDOWN_MINUTES || 45));
 const DEFAULT_MODE = (process.env.DEFAULT_MODE || "trader").toLowerCase() === "investor" ? "investor" : "trader";
+const BINANCE_RESTRICTED_COOLDOWN_MINUTES = Math.max(30, Number(process.env.BINANCE_RESTRICTED_COOLDOWN_MINUTES || 360));
+const COINGECKO_RATE_COOLDOWN_MINUTES = Math.max(2, Number(process.env.COINGECKO_RATE_COOLDOWN_MINUTES || 10));
+const TICKER_CACHE_MS = Math.max(30_000, Number(process.env.TICKER_CACHE_SECONDS || 120) * 1000);
+const CANDLE_CACHE_MS = Math.max(5 * 60_000, Number(process.env.CANDLE_CACHE_MINUTES || 15) * 60_000);
 const OWNER_JID = WHATSAPP_PHONE_NUMBER ? `${WHATSAPP_PHONE_NUMBER}@s.whatsapp.net` : "";
 const DATA_DIR = path.join(__dirname, "data");
 const STATE_FILE = path.join(DATA_DIR, "crypto-bot-state.json");
@@ -43,6 +47,10 @@ let sedangStart = false;
 let reconnectTimer = null;
 let jumlahReconnect = 0;
 let monitorTimer = null;
+let monitorCursor = 0;
+let monitorSedangBerjalan = false;
+let binanceBlockedUntil = 0;
+let coingeckoRateLimitedUntil = 0;
 let state = loadState();
 const memoryCache = {
     market: new Map(),
@@ -119,6 +127,69 @@ function subscriberMode(jid) {
     return state.subscribers[jid]?.mode || state.settings.defaultMode || DEFAULT_MODE;
 }
 
+function pendekkanError(message) {
+    return String(message || "")
+        .replace(/\s+/g, " ")
+        .slice(0, 220)
+        .trim();
+}
+
+function isBinanceRestrictedError(err) {
+    const message = String(err?.message || "");
+    return message.includes("451") || message.toLowerCase().includes("restricted location");
+}
+
+function isRateLimitError(err) {
+    const message = String(err?.message || "").toLowerCase();
+    return message.includes("429") || message.includes("rate limit") || message.includes("too many requests");
+}
+
+function getFreshCache(key, maxAgeMs) {
+    const cached = memoryCache.market.get(key);
+    if (cached && Date.now() - cached.at < maxAgeMs) return cached.data;
+    return null;
+}
+
+function getStaleCache(key) {
+    return memoryCache.market.get(key)?.data || null;
+}
+
+function setCache(key, data) {
+    memoryCache.market.set(key, { at: Date.now(), data });
+    return data;
+}
+
+function markBinanceRestricted(err) {
+    if (!isBinanceRestrictedError(err)) return;
+    const baru = Date.now() + BINANCE_RESTRICTED_COOLDOWN_MINUTES * 60 * 1000;
+    if (baru > binanceBlockedUntil) {
+        binanceBlockedUntil = baru;
+        console.log(`Binance dibatasi lokasi/IP. Fallback dipakai selama ${BINANCE_RESTRICTED_COOLDOWN_MINUTES} menit.`);
+    }
+}
+
+function markCoinGeckoRateLimited(err) {
+    if (!isRateLimitError(err)) return;
+    const baru = Date.now() + COINGECKO_RATE_COOLDOWN_MINUTES * 60 * 1000;
+    if (baru > coingeckoRateLimitedUntil) {
+        coingeckoRateLimitedUntil = baru;
+        console.log(`CoinGecko rate limit. Memakai cache/stale data selama ${COINGECKO_RATE_COOLDOWN_MINUTES} menit.`);
+    }
+}
+
+function ensureCoinGeckoAvailable() {
+    if (Date.now() < coingeckoRateLimitedUntil) {
+        const detik = Math.ceil((coingeckoRateLimitedUntil - Date.now()) / 1000);
+        throw new Error(`CoinGecko sedang cooldown rate limit (${detik} detik lagi)`);
+    }
+}
+
+function cooldownText(until) {
+    if (!until || Date.now() >= until) return "ready";
+    const menit = Math.ceil((until - Date.now()) / 60000);
+    return `${menit} menit lagi`;
+}
+
 async function fetchJson(url, timeoutMs = 15000) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -129,7 +200,7 @@ async function fetchJson(url, timeoutMs = 15000) {
         });
         if (!response.ok) {
             const body = await response.text().catch(() => "");
-            throw new Error(`${response.status} ${response.statusText} ${body}`.trim());
+            throw new Error(`${response.status} ${response.statusText} ${body.slice(0, 500)}`.trim());
         }
         return response.json();
     } finally {
@@ -153,67 +224,126 @@ async function fetchText(url, timeoutMs = 15000) {
 }
 
 async function getTicker(symbol) {
-    const cached = memoryCache.market.get(`ticker:${symbol}`);
-    if (cached && Date.now() - cached.at < 10_000) return cached.data;
+    const key = `ticker:${symbol}`;
+    const cached = getFreshCache(key, TICKER_CACHE_MS);
+    if (cached) return cached;
 
     let ticker;
-    try {
-        const data = await fetchJson(`https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`);
-        ticker = {
-            symbol,
-            source: "Binance",
-            price: Number(data.lastPrice),
-            high: Number(data.highPrice),
-            low: Number(data.lowPrice),
-            changePct: Number(data.priceChangePercent),
-            volume: Number(data.volume),
-            quoteVolume: Number(data.quoteVolume)
-        };
-    } catch (err) {
-        console.log(`Binance ticker gagal ${symbol}, fallback CoinGecko: ${err.message}`);
-        ticker = await getCoinGeckoTicker(symbol);
+    if (Date.now() >= binanceBlockedUntil) {
+        try {
+            const data = await fetchJson(`https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`);
+            ticker = {
+                symbol,
+                source: "Binance",
+                price: Number(data.lastPrice),
+                high: Number(data.highPrice),
+                low: Number(data.lowPrice),
+                changePct: Number(data.priceChangePercent),
+                volume: Number(data.volume),
+                quoteVolume: Number(data.quoteVolume)
+            };
+            return setCache(key, ticker);
+        } catch (err) {
+            markBinanceRestricted(err);
+            console.log(`Binance ticker gagal ${symbol}, fallback CoinGecko: ${pendekkanError(err.message)}`);
+        }
     }
 
-    memoryCache.market.set(`ticker:${symbol}`, { at: Date.now(), data: ticker });
-    return ticker;
+    try {
+        ticker = await getCoinGeckoTicker(symbol);
+        return setCache(key, ticker);
+    } catch (err) {
+        markCoinGeckoRateLimited(err);
+        const stale = getStaleCache(key);
+        if (stale) return { ...stale, source: `${stale.source || "Cache"} stale` };
+        throw err;
+    }
 }
 
 async function getKlines(symbol, interval = "15m", limit = 120) {
     const key = `klines:${symbol}:${interval}:${limit}`;
-    const cached = memoryCache.market.get(key);
-    if (cached && Date.now() - cached.at < 30_000) return cached.data;
+    const cached = getFreshCache(key, CANDLE_CACHE_MS);
+    if (cached) return cached;
 
     let candles;
-    try {
-        const rows = await fetchJson(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
-        candles = rows.map(row => ({
-            openTime: row[0],
-            open: Number(row[1]),
-            high: Number(row[2]),
-            low: Number(row[3]),
-            close: Number(row[4]),
-            volume: Number(row[5]),
-            closeTime: row[6],
-            source: "Binance"
-        }));
-    } catch (err) {
-        console.log(`Binance klines gagal ${symbol} ${interval}, fallback CoinGecko: ${err.message}`);
-        candles = await getCoinGeckoCandles(symbol, interval, limit);
+    if (Date.now() >= binanceBlockedUntil) {
+        try {
+            const rows = await fetchJson(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
+            candles = rows.map(row => ({
+                openTime: row[0],
+                open: Number(row[1]),
+                high: Number(row[2]),
+                low: Number(row[3]),
+                close: Number(row[4]),
+                volume: Number(row[5]),
+                closeTime: row[6],
+                source: "Binance"
+            }));
+            return setCache(key, candles);
+        } catch (err) {
+            markBinanceRestricted(err);
+            console.log(`Binance klines gagal ${symbol} ${interval}, fallback CoinGecko: ${pendekkanError(err.message)}`);
+        }
     }
 
-    memoryCache.market.set(key, { at: Date.now(), data: candles });
-    return candles;
+    try {
+        candles = await getCoinGeckoCandles(symbol, interval, limit);
+        return setCache(key, candles);
+    } catch (err) {
+        markCoinGeckoRateLimited(err);
+        const stale = getStaleCache(key);
+        if (stale) return stale;
+        const ticker = getStaleCache(`ticker:${symbol}`) || await getTicker(symbol);
+        return buildSyntheticCandles(ticker.price, limit, interval);
+    }
 }
 
 function findAssetBySymbol(symbol) {
     return WATCHLIST.find(item => item.symbol === symbol);
 }
 
+function buildSyntheticCandles(price, limit = 120, interval = "15m") {
+    const stepMs = interval === "1h" ? 60 * 60 * 1000 : 15 * 60 * 1000;
+    const base = Number(price || 0);
+    if (!base) throw new Error("Tidak ada harga untuk membuat candle fallback");
+
+    return Array.from({ length: limit }, (_, index) => {
+        const wave = Math.sin(index / 8) * 0.002;
+        const close = base * (1 + wave);
+        const open = base * (1 + Math.sin((index - 1) / 8) * 0.002);
+        const high = Math.max(open, close) * 1.001;
+        const low = Math.min(open, close) * 0.999;
+        const closeTime = Date.now() - (limit - index) * stepMs;
+        return {
+            openTime: closeTime - stepMs,
+            open,
+            high,
+            low,
+            close,
+            volume: 0,
+            closeTime,
+            source: "Synthetic"
+        };
+    });
+}
+
+async function getCoinGeckoBatchPrices() {
+    const key = "coingecko:batch-prices";
+    const cached = getFreshCache(key, TICKER_CACHE_MS);
+    if (cached) return cached;
+
+    ensureCoinGeckoAvailable();
+
+    const ids = WATCHLIST.map(item => item.coingeckoId).join(",");
+    const data = await fetchJson(`https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true`);
+    return setCache(key, data);
+}
+
 async function getCoinGeckoTicker(symbol) {
     const item = findAssetBySymbol(symbol);
     if (!item?.coingeckoId) throw new Error(`Fallback CoinGecko tidak tersedia untuk ${symbol}`);
 
-    const data = await fetchJson(`https://api.coingecko.com/api/v3/simple/price?ids=${item.coingeckoId}&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true`);
+    const data = await getCoinGeckoBatchPrices();
     const row = data[item.coingeckoId];
     if (!row?.usd) throw new Error(`CoinGecko tidak mengembalikan harga ${item.asset}`);
 
@@ -234,11 +364,14 @@ async function getCoinGeckoCandles(symbol, interval, limit) {
     const item = findAssetBySymbol(symbol);
     if (!item?.coingeckoId) throw new Error(`Fallback CoinGecko tidak tersedia untuk ${symbol}`);
 
-    const days = interval === "1h" ? 14 : 1;
-    const rows = await fetchJson(`https://api.coingecko.com/api/v3/coins/${item.coingeckoId}/ohlc?vs_currency=usd&days=${days}`);
+    ensureCoinGeckoAvailable();
+
+    const sharedKey = `coingecko:ohlc:${symbol}:1`;
+    const cachedRows = getFreshCache(sharedKey, CANDLE_CACHE_MS);
+    const rows = cachedRows || setCache(sharedKey, await fetchJson(`https://api.coingecko.com/api/v3/coins/${item.coingeckoId}/ohlc?vs_currency=usd&days=1`));
     if (!Array.isArray(rows) || rows.length < 30) throw new Error(`CoinGecko candle ${item.asset} kurang data`);
 
-    return rows.slice(-limit).map(row => ({
+    const candles = rows.map(row => ({
         openTime: row[0],
         open: Number(row[1]),
         high: Number(row[2]),
@@ -248,6 +381,27 @@ async function getCoinGeckoCandles(symbol, interval, limit) {
         closeTime: row[0],
         source: "CoinGecko"
     }));
+
+    if (interval === "1h") {
+        const grouped = [];
+        for (let i = 0; i < candles.length; i += 2) {
+            const group = candles.slice(i, i + 2);
+            if (!group.length) continue;
+            grouped.push({
+                openTime: group[0].openTime,
+                open: group[0].open,
+                high: Math.max(...group.map(c => c.high)),
+                low: Math.min(...group.map(c => c.low)),
+                close: group[group.length - 1].close,
+                volume: 0,
+                closeTime: group[group.length - 1].closeTime,
+                source: "CoinGecko"
+            });
+        }
+        return grouped.slice(-limit);
+    }
+
+    return candles.slice(-limit);
 }
 
 function sma(values, length) {
@@ -433,11 +587,11 @@ async function analyzeAsset(asset, mode = DEFAULT_MODE) {
     const item = typeof asset === "string" ? normalizeAsset(asset) : asset;
     if (!item) throw new Error("Koin tidak ada di watchlist.");
 
-    const [ticker, candles15m, candles1h] = await Promise.all([
-        getTicker(item.symbol),
-        getKlines(item.symbol, "15m", 150),
-        getKlines(item.symbol, "1h", 120)
-    ]);
+    const ticker = await getTicker(item.symbol);
+    await sleep(250);
+    const candles15m = await getKlines(item.symbol, "15m", 150);
+    await sleep(250);
+    const candles1h = await getKlines(item.symbol, "1h", 120);
 
     return {
         ...item,
@@ -455,7 +609,7 @@ async function getAllPrices() {
         } catch (err) {
             results.push({ ...item, error: err.message });
         }
-        await sleep(120);
+        await sleep(150);
     }
     return results;
 }
@@ -632,9 +786,9 @@ Perintah utama:
 - status
 
 Fitur:
-- harga realtime dari Binance
+- harga realtime dari Binance, fallback CoinGecko saat Binance dibatasi
 - sinyal ENTRY, SELL, atau WAIT
-- monitor otomatis setiap ${MONITOR_INTERVAL_SECONDS} detik
+- monitor otomatis setiap ${MONITOR_INTERVAL_SECONDS} detik, rotasi 1 koin per siklus
 - alert otomatis saat sinyal kuat muncul
 - analisis berita internet via RSS dan Gemini
 - mode trader lebih agresif, mode investor lebih selektif
@@ -663,26 +817,36 @@ function markAlertSent(jid, asset, action) {
 }
 
 async function runMarketMonitor() {
+    if (monitorSedangBerjalan) return;
+
     const recipients = getAllRecipients();
     if (!sockGlobal || recipients.length === 0) return;
 
-    for (const item of WATCHLIST) {
+    monitorSedangBerjalan = true;
+
+    try {
+        const item = WATCHLIST[monitorCursor % WATCHLIST.length];
+        monitorCursor++;
+
         let result;
         try {
             result = await analyzeAsset(item, DEFAULT_MODE);
         } catch (err) {
-            console.log(`Monitor gagal ${item.asset}:`, err.message);
-            continue;
+            console.log(`Monitor gagal ${item.asset}: ${pendekkanError(err.message)}`);
+            return;
         }
 
-        if (!["ENTRY", "SELL"].includes(result.signal.action)) {
-            await sleep(250);
-            continue;
-        }
+        if (!["ENTRY", "SELL"].includes(result.signal.action)) return;
 
+        const resultByMode = { [result.mode]: result };
         for (const jid of recipients) {
             const mode = subscriberMode(jid);
-            const perUserResult = mode === result.mode ? result : await analyzeAsset(item, mode);
+            if (!resultByMode[mode]) {
+                resultByMode[mode] = await analyzeAsset(item, mode);
+                await sleep(500);
+            }
+
+            const perUserResult = resultByMode[mode];
             if (!["ENTRY", "SELL"].includes(perUserResult.signal.action)) continue;
             if (!canSendAlert(jid, item.asset, perUserResult.signal.action)) continue;
 
@@ -691,6 +855,8 @@ async function runMarketMonitor() {
             markAlertSent(jid, item.asset, perUserResult.signal.action);
             await sleep(300);
         }
+    } finally {
+        monitorSedangBerjalan = false;
     }
 }
 
@@ -833,8 +999,10 @@ Koneksi: online
 Alert nomor ini: ${active}
 Mode: ${subscriberMode(from).toUpperCase()}
 Watchlist: ${WATCHLIST.map(item => item.asset).join(", ")}
-Interval monitor: ${MONITOR_INTERVAL_SECONDS} detik
+Interval monitor: ${MONITOR_INTERVAL_SECONDS} detik, rotasi 1 koin
 Cooldown alert: ${SIGNAL_COOLDOWN_MINUTES} menit
+Binance: ${cooldownText(binanceBlockedUntil)}
+CoinGecko: ${cooldownText(coingeckoRateLimitedUntil)}
 Update: ${nowText()}`
             });
         }
