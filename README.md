@@ -27,6 +27,8 @@ Bot bisa menjawab harga realtime, membuat analisa teknikal, membaca berita crypt
 - Mode `trader` untuk sinyal lebih cepat.
 - Mode `investor` untuk sinyal lebih selektif.
 - Alert otomatis ke WhatsApp ketika sinyal kuat muncul.
+- Laporan market otomatis berkala tanpa perlu diminta manual.
+- Laporan berisi arah kemungkinan koin, teknikal, fundamental/news terbaru, dan catatan risiko.
 - Cooldown alert agar bot tidak spam.
 - Analisis berita crypto dari RSS internet.
 - Ringkasan dampak berita memakai Gemini jika `GEMINI_API_KEY` diisi.
@@ -47,6 +49,7 @@ analisa ETH investor
 analisa BNB trader
 berita
 berita BTC
+laporan
 watchlist
 alert on
 alert off
@@ -72,6 +75,9 @@ PORT=7860
 MONITOR_INTERVAL_SECONDS=60
 SIGNAL_COOLDOWN_MINUTES=45
 DEFAULT_MODE=trader
+AUTO_REPORT_ENABLED=true
+AUTO_REPORT_INTERVAL_MINUTES=60
+AUTO_REPORT_START_DELAY_SECONDS=90
 TICKER_CACHE_SECONDS=120
 CANDLE_CACHE_MINUTES=15
 BINANCE_RESTRICTED_COOLDOWN_MINUTES=360
@@ -85,6 +91,9 @@ Keterangan:
 - `MONITOR_INTERVAL_SECONDS` minimal 30 detik.
 - `SIGNAL_COOLDOWN_MINUTES` mencegah alert berulang untuk koin dan arah sinyal yang sama.
 - `DEFAULT_MODE` bisa `trader` atau `investor`.
+- `AUTO_REPORT_ENABLED=true` membuat bot mengirim laporan otomatis setelah online.
+- `AUTO_REPORT_INTERVAL_MINUTES` mengatur jarak laporan otomatis. Minimal 15 menit agar WhatsApp dan API tidak mudah limit.
+- `AUTO_REPORT_START_DELAY_SECONDS` mengatur jeda laporan pertama setelah bot online.
 - `TICKER_CACHE_SECONDS` dan `CANDLE_CACHE_MINUTES` menjaga bot tidak terlalu sering memukul API gratis.
 - `BINANCE_RESTRICTED_COOLDOWN_MINUTES` membuat bot berhenti sementara mencoba Binance jika server terkena blokir lokasi `451`.
 - `COINGECKO_RATE_COOLDOWN_MINUTES` membuat bot memakai cache dulu saat CoinGecko membalas `429`.
