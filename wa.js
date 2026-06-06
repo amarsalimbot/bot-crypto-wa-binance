@@ -18,6 +18,9 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const MONITOR_INTERVAL_SECONDS = Math.max(30, Number(process.env.MONITOR_INTERVAL_SECONDS || 60));
 const SIGNAL_COOLDOWN_MINUTES = Math.max(5, Number(process.env.SIGNAL_COOLDOWN_MINUTES || 45));
 const DEFAULT_MODE = (process.env.DEFAULT_MODE || "trader").toLowerCase() === "investor" ? "investor" : "trader";
+const AUTO_REPORT_ENABLED = String(process.env.AUTO_REPORT_ENABLED || "true").toLowerCase() !== "false";
+const AUTO_REPORT_INTERVAL_MINUTES = Math.max(15, Number(process.env.AUTO_REPORT_INTERVAL_MINUTES || 60));
+const AUTO_REPORT_START_DELAY_SECONDS = Math.max(30, Number(process.env.AUTO_REPORT_START_DELAY_SECONDS || 90));
 const BINANCE_RESTRICTED_COOLDOWN_MINUTES = Math.max(30, Number(process.env.BINANCE_RESTRICTED_COOLDOWN_MINUTES || 360));
 const COINGECKO_RATE_COOLDOWN_MINUTES = Math.max(2, Number(process.env.COINGECKO_RATE_COOLDOWN_MINUTES || 10));
 const TICKER_CACHE_MS = Math.max(30_000, Number(process.env.TICKER_CACHE_SECONDS || 120) * 1000);
@@ -47,8 +50,11 @@ let sedangStart = false;
 let reconnectTimer = null;
 let jumlahReconnect = 0;
 let monitorTimer = null;
+let autoReportTimer = null;
+let autoReportStartupTimer = null;
 let monitorCursor = 0;
 let monitorSedangBerjalan = false;
+let autoReportSedangBerjalan = false;
 let binanceBlockedUntil = 0;
 let coingeckoRateLimitedUntil = 0;
 let state = loadState();
@@ -658,6 +664,100 @@ Volatilitas 15m: ${i.volatility.toFixed(2)}%
 Catatan: ini analisis probabilitas, bukan nasihat keuangan. Gunakan risk management.`;
 }
 
+function signalEmoji(action) {
+    if (action === "ENTRY") return "🟢";
+    if (action === "SELL") return "🔴";
+    return "🟡";
+}
+
+function directionText(signal) {
+    if (signal.action === "ENTRY") return "cenderung naik / bullish";
+    if (signal.action === "SELL") return "rawan turun / koreksi";
+    if (signal.entryScore > signal.sellScore + 8) return "mulai condong naik";
+    if (signal.sellScore > signal.entryScore + 8) return "mulai condong turun";
+    return "sideways / tunggu konfirmasi";
+}
+
+function compactReasons(reasons) {
+    return reasons.slice(0, 2).join("; ") || "belum ada konfirmasi kuat";
+}
+
+async function buildFundamentalBrief() {
+    const items = await getCryptoNews().catch(err => {
+        console.log(`News gagal untuk auto report: ${pendekkanError(err.message)}`);
+        return [];
+    });
+
+    const selected = items.slice(0, 5);
+    if (!selected.length) {
+        return "📰 *Fundamental & News*\nBelum ada berita terbaru yang berhasil diambil. Fokus sementara ke teknikal dan risk management.";
+    }
+
+    if (!ai) {
+        return `📰 *Fundamental & News*\n${selected.map((item, index) => `${index + 1}. ${item.title}`).join("\n")}`;
+    }
+
+    const prompt = `Kamu analis crypto berbahasa Indonesia.
+Ringkas berita berikut menjadi 3 poin singkat untuk laporan WhatsApp.
+Fokus dampak fundamental ke BTC, ETH, BNB, PAXG, XAUT.
+Tentukan sentimen umum: bullish, bearish, atau mixed.
+Jangan pakai markdown tabel.
+
+Berita:
+${selected.map((item, index) => `${index + 1}. ${item.title}\n${item.description}`).join("\n\n")}`;
+
+    try {
+        const response = await ai.models.generateContent({
+            model: "gemini-2.5-flash",
+            contents: prompt
+        });
+        const text = response.text || response.candidates?.[0]?.content?.parts?.[0]?.text || "";
+        return `📰 *Fundamental & News*\n${text.trim()}`;
+    } catch (err) {
+        console.log(`Gemini auto news gagal: ${pendekkanError(err.message)}`);
+        return `📰 *Fundamental & News*\n${selected.map((item, index) => `${index + 1}. ${item.title}`).join("\n")}`;
+    }
+}
+
+async function buildAutoMarketReport(mode = DEFAULT_MODE) {
+    const analyses = [];
+
+    for (const item of WATCHLIST) {
+        try {
+            analyses.push(await analyzeAsset(item, mode));
+        } catch (err) {
+            analyses.push({ ...item, error: pendekkanError(err.message) });
+        }
+        await sleep(700);
+    }
+
+    let text = `🚨 *AUTO MARKET REPORT*\n`;
+    text += `⏰ ${nowText()}\n`;
+    text += `⚙️ Mode: *${mode.toUpperCase()}*\n`;
+    text += `📡 Sumber: Binance, fallback CoinGecko/cache\n\n`;
+    text += `📊 *Arah Kemungkinan Koin*\n`;
+
+    for (const row of analyses) {
+        if (row.error) {
+            text += `\n⚪ *${row.asset}* - data belum siap\n   ${row.error}`;
+            continue;
+        }
+
+        const digits = row.ticker.price >= 100 ? 2 : 4;
+        const { signal } = row;
+        text += `\n${signalEmoji(signal.action)} *${row.asset}* ${formatUsd(row.ticker.price, digits)} (${formatPct(row.ticker.changePct)})`;
+        text += `\n   Arah: *${directionText(signal)}*`;
+        text += `\n   Sinyal: *${signal.action}* | Confidence ${signal.score}/100`;
+        text += `\n   Teknis: ${compactReasons(signal.reasons)}`;
+        text += `\n   Support/Resist: ${formatUsd(signal.indicators.support, digits)} / ${formatUsd(signal.indicators.resistance, digits)}`;
+    }
+
+    text += `\n\n${await buildFundamentalBrief()}`;
+    text += `\n\n🛡️ *Catatan Risiko*\nGunakan stop loss, atur ukuran posisi, dan jangan entry hanya karena satu sinyal.`;
+
+    return text;
+}
+
 function decodeEntities(text) {
     return String(text || "")
         .replace(/<!\[CDATA\[(.*?)\]\]>/gs, "$1")
@@ -779,6 +879,7 @@ Perintah utama:
 - analisa BNB trader
 - berita
 - berita BTC
+- laporan
 - alert on
 - alert off
 - mode trader
@@ -789,6 +890,7 @@ Fitur:
 - harga realtime dari Binance, fallback CoinGecko saat Binance dibatasi
 - sinyal ENTRY, SELL, atau WAIT
 - monitor otomatis setiap ${MONITOR_INTERVAL_SECONDS} detik, rotasi 1 koin per siklus
+- laporan otomatis setiap ${AUTO_REPORT_INTERVAL_MINUTES} menit
 - alert otomatis saat sinyal kuat muncul
 - analisis berita internet via RSS dan Gemini
 - mode trader lebih agresif, mode investor lebih selektif
@@ -803,6 +905,51 @@ async function sendSafe(jid, text) {
     } catch (err) {
         console.log(`Gagal kirim ke ${jid}:`, err.message);
     }
+}
+
+async function sendAutomaticReport(alasan = "jadwal") {
+    if (autoReportSedangBerjalan) return;
+    if (!AUTO_REPORT_ENABLED || !sockGlobal) return;
+
+    const recipients = getAllRecipients();
+    if (!recipients.length) return;
+
+    autoReportSedangBerjalan = true;
+    try {
+        console.log(`Mengirim auto market report (${alasan}) ke ${recipients.length} penerima.`);
+
+        const reportsByMode = {};
+        for (const jid of recipients) {
+            const mode = subscriberMode(jid);
+            if (!reportsByMode[mode]) reportsByMode[mode] = await buildAutoMarketReport(mode);
+            await sendSafe(jid, reportsByMode[mode]);
+            await sleep(1000);
+        }
+    } catch (err) {
+        console.log(`Auto report gagal: ${pendekkanError(err.message)}`);
+    } finally {
+        autoReportSedangBerjalan = false;
+    }
+}
+
+function startAutomaticReports() {
+    if (!AUTO_REPORT_ENABLED) {
+        console.log("Auto market report nonaktif via AUTO_REPORT_ENABLED=false.");
+        return;
+    }
+
+    if (autoReportTimer) clearInterval(autoReportTimer);
+    if (autoReportStartupTimer) clearTimeout(autoReportStartupTimer);
+
+    autoReportStartupTimer = setTimeout(() => {
+        sendAutomaticReport("startup").catch(err => console.log("Auto report startup error:", err.message));
+    }, AUTO_REPORT_START_DELAY_SECONDS * 1000);
+
+    autoReportTimer = setInterval(() => {
+        sendAutomaticReport("jadwal").catch(err => console.log("Auto report interval error:", err.message));
+    }, AUTO_REPORT_INTERVAL_MINUTES * 60 * 1000);
+
+    console.log(`Auto market report aktif setiap ${AUTO_REPORT_INTERVAL_MINUTES} menit.`);
 }
 
 function canSendAlert(jid, asset, action) {
@@ -882,6 +1029,8 @@ function startKeepAliveServer() {
                 subscribers: Object.values(state.subscribers).filter(item => item.active).length,
                 reconnect: jumlahReconnect,
                 monitor_interval_seconds: MONITOR_INTERVAL_SECONDS,
+                auto_report_enabled: AUTO_REPORT_ENABLED,
+                auto_report_interval_minutes: AUTO_REPORT_INTERVAL_MINUTES,
                 time: nowText()
             }));
             return;
@@ -1000,6 +1149,7 @@ Alert nomor ini: ${active}
 Mode: ${subscriberMode(from).toUpperCase()}
 Watchlist: ${WATCHLIST.map(item => item.asset).join(", ")}
 Interval monitor: ${MONITOR_INTERVAL_SECONDS} detik, rotasi 1 koin
+Laporan otomatis: ${AUTO_REPORT_ENABLED ? `${AUTO_REPORT_INTERVAL_MINUTES} menit` : "OFF"}
 Cooldown alert: ${SIGNAL_COOLDOWN_MINUTES} menit
 Binance: ${cooldownText(binanceBlockedUntil)}
 CoinGecko: ${cooldownText(coingeckoRateLimitedUntil)}
@@ -1038,6 +1188,11 @@ Update: ${nowText()}`
 
         if (/^(berita|news|kabar pasar)\b/i.test(lower)) {
             return sock.sendMessage(from, { text: await summarizeNews(pesan) });
+        }
+
+        if (/^(laporan|auto report|market report|report)\b/i.test(lower)) {
+            const mode = /\binvestor\b/i.test(lower) ? "investor" : /\btrader\b/i.test(lower) ? "trader" : subscriberMode(from);
+            return sock.sendMessage(from, { text: await buildAutoMarketReport(mode) });
         }
 
         if (/^(watchlist|koin)$/i.test(lower)) {
@@ -1112,6 +1267,7 @@ async function startBot() {
                     reconnectTimer = null;
                 }
                 startMarketMonitor();
+                startAutomaticReports();
                 if (OWNER_JID) {
                     await sendSafe(OWNER_JID, `Bot Analisa Crypto online.\nKetik menu untuk melihat fitur.\nUpdate: ${nowText()}`);
                 }
