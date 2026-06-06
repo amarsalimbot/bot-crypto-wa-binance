@@ -18,6 +18,9 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const MONITOR_INTERVAL_SECONDS = Math.max(30, Number(process.env.MONITOR_INTERVAL_SECONDS || 60));
 const SIGNAL_COOLDOWN_MINUTES = Math.max(5, Number(process.env.SIGNAL_COOLDOWN_MINUTES || 45));
 const DEFAULT_MODE = (process.env.DEFAULT_MODE || "trader").toLowerCase() === "investor" ? "investor" : "trader";
+const MARKET_DATA_PROVIDER = ["auto", "binance", "coingecko"].includes(String(process.env.MARKET_DATA_PROVIDER || "coingecko").toLowerCase())
+    ? String(process.env.MARKET_DATA_PROVIDER || "coingecko").toLowerCase()
+    : "coingecko";
 const AUTO_REPORT_ENABLED = String(process.env.AUTO_REPORT_ENABLED || "true").toLowerCase() !== "false";
 const AUTO_REPORT_INTERVAL_MINUTES = Math.max(15, Number(process.env.AUTO_REPORT_INTERVAL_MINUTES || 60));
 const AUTO_REPORT_START_DELAY_SECONDS = Math.max(30, Number(process.env.AUTO_REPORT_START_DELAY_SECONDS || 90));
@@ -196,6 +199,12 @@ function cooldownText(until) {
     return `${menit} menit lagi`;
 }
 
+function bolehPakaiBinance() {
+    if (MARKET_DATA_PROVIDER === "coingecko") return false;
+    if (MARKET_DATA_PROVIDER === "binance") return true;
+    return Date.now() >= binanceBlockedUntil;
+}
+
 async function fetchJson(url, timeoutMs = 15000) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -235,7 +244,7 @@ async function getTicker(symbol) {
     if (cached) return cached;
 
     let ticker;
-    if (Date.now() >= binanceBlockedUntil) {
+    if (bolehPakaiBinance()) {
         try {
             const data = await fetchJson(`https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`);
             ticker = {
@@ -251,7 +260,8 @@ async function getTicker(symbol) {
             return setCache(key, ticker);
         } catch (err) {
             markBinanceRestricted(err);
-            console.log(`Binance ticker gagal ${symbol}, fallback CoinGecko: ${pendekkanError(err.message)}`);
+            if (MARKET_DATA_PROVIDER === "binance") throw err;
+            console.log(`Binance tidak tersedia untuk ${symbol}; memakai CoinGecko.`);
         }
     }
 
@@ -272,7 +282,7 @@ async function getKlines(symbol, interval = "15m", limit = 120) {
     if (cached) return cached;
 
     let candles;
-    if (Date.now() >= binanceBlockedUntil) {
+    if (bolehPakaiBinance()) {
         try {
             const rows = await fetchJson(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
             candles = rows.map(row => ({
@@ -288,7 +298,8 @@ async function getKlines(symbol, interval = "15m", limit = 120) {
             return setCache(key, candles);
         } catch (err) {
             markBinanceRestricted(err);
-            console.log(`Binance klines gagal ${symbol} ${interval}, fallback CoinGecko: ${pendekkanError(err.message)}`);
+            if (MARKET_DATA_PROVIDER === "binance") throw err;
+            console.log(`Binance candle tidak tersedia untuk ${symbol} ${interval}; memakai CoinGecko/cache.`);
         }
     }
 
@@ -621,16 +632,16 @@ async function getAllPrices() {
 }
 
 function buildPriceMessage(rows) {
-    let text = `DAFTAR HARGA REALTIME BINANCE\nUpdate: ${nowText()}\n\n`;
+    let text = `📊 *DAFTAR HARGA REALTIME*\n📡 Provider: ${MARKET_DATA_PROVIDER.toUpperCase()}\n⏰ Update: ${nowText()}\n\n`;
     for (const row of rows) {
         if (row.error) {
             text += `${row.asset}: gagal ambil data (${row.error})\n`;
             continue;
         }
         const digits = row.ticker.price >= 100 ? 2 : 4;
-        text += `${row.asset}/USDT: ${formatUsd(row.ticker.price, digits)} (${formatPct(row.ticker.changePct)} 24j)\n`;
-        text += `Sumber: ${row.ticker.source || "Binance"}\n`;
-        text += `High/Low: ${formatUsd(row.ticker.high, digits)} / ${formatUsd(row.ticker.low, digits)}\n\n`;
+        text += `💠 *${row.asset}/USDT*: ${formatUsd(row.ticker.price, digits)} (${formatPct(row.ticker.changePct)} 24j)\n`;
+        text += `📡 Sumber: ${row.ticker.source || "Market API"}\n`;
+        text += `📈 High/Low: ${formatUsd(row.ticker.high, digits)} / ${formatUsd(row.ticker.low, digits)}\n\n`;
     }
     text += "Ketik: analisa BTC, analisa ETH investor, berita, alert on.";
     return text.trim();
@@ -734,7 +745,7 @@ async function buildAutoMarketReport(mode = DEFAULT_MODE) {
     let text = `🚨 *AUTO MARKET REPORT*\n`;
     text += `⏰ ${nowText()}\n`;
     text += `⚙️ Mode: *${mode.toUpperCase()}*\n`;
-    text += `📡 Sumber: Binance, fallback CoinGecko/cache\n\n`;
+    text += `📡 Provider: ${MARKET_DATA_PROVIDER.toUpperCase()} | sumber aktual mengikuti data tersedia\n\n`;
     text += `📊 *Arah Kemungkinan Koin*\n`;
 
     for (const row of analyses) {
@@ -887,7 +898,7 @@ Perintah utama:
 - status
 
 Fitur:
-- harga realtime dari Binance, fallback CoinGecko saat Binance dibatasi
+- harga realtime dari provider market yang dipilih
 - sinyal ENTRY, SELL, atau WAIT
 - monitor otomatis setiap ${MONITOR_INTERVAL_SECONDS} detik, rotasi 1 koin per siklus
 - laporan otomatis setiap ${AUTO_REPORT_INTERVAL_MINUTES} menit
@@ -1148,6 +1159,7 @@ Koneksi: online
 Alert nomor ini: ${active}
 Mode: ${subscriberMode(from).toUpperCase()}
 Watchlist: ${WATCHLIST.map(item => item.asset).join(", ")}
+Provider market: ${MARKET_DATA_PROVIDER.toUpperCase()}
 Interval monitor: ${MONITOR_INTERVAL_SECONDS} detik, rotasi 1 koin
 Laporan otomatis: ${AUTO_REPORT_ENABLED ? `${AUTO_REPORT_INTERVAL_MINUTES} menit` : "OFF"}
 Cooldown alert: ${SIGNAL_COOLDOWN_MINUTES} menit
