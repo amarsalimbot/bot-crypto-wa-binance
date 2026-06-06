@@ -72,6 +72,7 @@ Variable opsional:
 GEMINI_API_KEY=isi_api_key_gemini_anda
 APP_TIMEZONE=Asia/Makassar
 PORT=7860
+MARKET_DATA_PROVIDER=coingecko
 MONITOR_INTERVAL_SECONDS=60
 SIGNAL_COOLDOWN_MINUTES=45
 DEFAULT_MODE=trader
@@ -88,6 +89,7 @@ Keterangan:
 
 - `WHATSAPP_PHONE_NUMBER` adalah nomor WhatsApp bot dalam format internasional tanpa tanda plus.
 - `GEMINI_API_KEY` dipakai untuk merangkum dampak berita. Tanpa ini, bot tetap jalan tetapi hanya menampilkan daftar berita.
+- `MARKET_DATA_PROVIDER` bisa `coingecko`, `auto`, atau `binance`. Gunakan `coingecko` jika server terkena error Binance `451 restricted location`.
 - `MONITOR_INTERVAL_SECONDS` minimal 30 detik.
 - `SIGNAL_COOLDOWN_MINUTES` mencegah alert berulang untuk koin dan arah sinyal yang sama.
 - `DEFAULT_MODE` bisa `trader` atau `investor`.
