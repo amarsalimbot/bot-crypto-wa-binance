@@ -83,8 +83,10 @@ AUTO_REPORT_START_DELAY_SECONDS=90
 TRADER_CANDLE_MINUTES=15
 INVESTOR_CANDLE_MINUTES=60
 CANDLE_REPORT_DELAY_SECONDS=20
-TICKER_CACHE_SECONDS=120
-CANDLE_CACHE_MINUTES=15
+TICKER_CACHE_SECONDS=20
+CANDLE_CACHE_MINUTES=2
+FORCE_REFRESH_ON_REQUEST=true
+FORCE_REFRESH_DEDUP_SECONDS=10
 BINANCE_RESTRICTED_COOLDOWN_MINUTES=360
 COINGECKO_RATE_COOLDOWN_MINUTES=10
 ```
@@ -104,7 +106,10 @@ Keterangan:
 - `CANDLE_REPORT_DELAY_SECONDS=20` memberi jeda setelah candle close agar data market sudah update.
 - `AUTO_REPORT_INTERVAL_MINUTES` hanya dipakai jika `AUTO_REPORT_MODE=interval` atau `both`.
 - `AUTO_REPORT_START_DELAY_SECONDS` mengatur jeda laporan pertama setelah bot online.
-- `TICKER_CACHE_SECONDS` dan `CANDLE_CACHE_MINUTES` menjaga bot tidak terlalu sering memukul API gratis.
+- `TICKER_CACHE_SECONDS` default 20 detik agar harga tetap segar tanpa mudah kena rate limit.
+- `CANDLE_CACHE_MINUTES` default 2 menit. Candle terakhir tetap disinkronkan dengan harga live terbaru.
+- `FORCE_REFRESH_ON_REQUEST=true` membuat perintah `harga`, `analisa`, dan laporan otomatis mengambil harga terbaru.
+- `FORCE_REFRESH_DEDUP_SECONDS` mencegah force refresh 5 koin menjadi 5 request batch beruntun.
 - `BINANCE_RESTRICTED_COOLDOWN_MINUTES` membuat bot berhenti sementara mencoba Binance jika server terkena blokir lokasi `451`.
 - `COINGECKO_RATE_COOLDOWN_MINUTES` membuat bot memakai cache dulu saat CoinGecko membalas `429`.
 
