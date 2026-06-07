@@ -8,7 +8,6 @@
   },
   "dependencies": {
     "@whiskeysockets/baileys": "latest",
-    "@google/genai": "latest",
     "pino": "latest"
   }
 }
