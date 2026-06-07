@@ -5,7 +5,6 @@ const {
     DisconnectReason
 } = require("@whiskeysockets/baileys");
 
-const { GoogleGenAI } = require("@google/genai");
 const pino = require("pino");
 const http = require("http");
 const fs = require("fs");
@@ -14,7 +13,9 @@ const path = require("path");
 const APP_TIMEZONE = process.env.APP_TIMEZONE || "Asia/Makassar";
 const PORT = Number(process.env.PORT || 7860);
 const WHATSAPP_PHONE_NUMBER = String(process.env.WHATSAPP_PHONE_NUMBER || "").replace(/\D/g, "");
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || "";
+const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || "deepseek-chat";
+const DEEPSEEK_API_URL = process.env.DEEPSEEK_API_URL || "https://api.deepseek.com/chat/completions";
 const MONITOR_INTERVAL_SECONDS = Math.max(30, Number(process.env.MONITOR_INTERVAL_SECONDS || 60));
 const SIGNAL_COOLDOWN_MINUTES = Math.max(5, Number(process.env.SIGNAL_COOLDOWN_MINUTES || 45));
 const DEFAULT_MODE = (process.env.DEFAULT_MODE || "trader").toLowerCase() === "investor" ? "investor" : "trader";
@@ -54,7 +55,7 @@ const NEWS_FEEDS = [
     "https://cryptonews.com/news/feed/"
 ];
 
-const ai = GEMINI_API_KEY ? new GoogleGenAI({ apiKey: GEMINI_API_KEY }) : null;
+const aiEnabled = Boolean(DEEPSEEK_API_KEY);
 
 let sockGlobal = null;
 let sedangStart = false;
@@ -262,18 +263,21 @@ function getRecipientsForMode(mode) {
     return ids;
 }
 
-async function fetchJson(url, timeoutMs = 15000) {
+async function fetchJson(url, timeoutMs = 15000, requestOptions = {}) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const requestHeaders = {
+        "User-Agent": "crypto-wa-bot/1.0",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        ...(requestOptions.headers || {})
+    };
     try {
         const response = await fetch(url, {
+            ...requestOptions,
             signal: controller.signal,
             cache: "no-store",
-            headers: {
-                "User-Agent": "crypto-wa-bot/1.0",
-                "Cache-Control": "no-cache",
-                "Pragma": "no-cache"
-            }
+            headers: requestHeaders
         });
         if (!response.ok) {
             const body = await response.text().catch(() => "");
@@ -303,6 +307,34 @@ async function fetchText(url, timeoutMs = 15000) {
     } finally {
         clearTimeout(timeout);
     }
+}
+
+async function generateAiText(prompt, options = {}) {
+    if (!aiEnabled) throw new Error("DEEPSEEK_API_KEY belum diisi.");
+
+    const data = await fetchJson(DEEPSEEK_API_URL, options.timeoutMs || 30000, {
+        method: "POST",
+        headers: {
+            "Authorization": `Bearer ${DEEPSEEK_API_KEY}`,
+            "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+            model: options.model || DEEPSEEK_MODEL,
+            messages: [
+                {
+                    role: "system",
+                    content: "Kamu analis pasar crypto profesional. Jawab ringkas, jelas, berbahasa Indonesia, dan cocok dibaca di WhatsApp."
+                },
+                { role: "user", content: prompt }
+            ],
+            temperature: options.temperature ?? 0.35,
+            max_tokens: options.maxTokens || 700
+        })
+    });
+
+    const text = data?.choices?.[0]?.message?.content;
+    if (!text) throw new Error("Respon DeepSeek kosong.");
+    return String(text).trim();
 }
 
 async function getTicker(symbol, options = {}) {
@@ -863,7 +895,7 @@ async function buildFundamentalBrief() {
         return "📰 *Fundamental & News*\nBelum ada berita terbaru yang berhasil diambil. Fokus sementara ke teknikal dan risk management.";
     }
 
-    if (!ai) {
+    if (!aiEnabled) {
         return `📰 *Fundamental & News*\n${selected.map((item, index) => `${index + 1}. ${item.title}`).join("\n")}`;
     }
 
@@ -877,14 +909,10 @@ Berita:
 ${selected.map((item, index) => `${index + 1}. ${item.title}\n${item.description}`).join("\n\n")}`;
 
     try {
-        const response = await ai.models.generateContent({
-            model: "gemini-2.5-flash",
-            contents: prompt
-        });
-        const text = response.text || response.candidates?.[0]?.content?.parts?.[0]?.text || "";
+        const text = await generateAiText(prompt, { maxTokens: 500 });
         return `📰 *Fundamental & News*\n${text.trim()}`;
     } catch (err) {
-        console.log(`Gemini auto news gagal: ${pendekkanError(err.message)}`);
+        console.log(`DeepSeek auto news gagal: ${pendekkanError(err.message)}`);
         return `📰 *Fundamental & News*\n${selected.map((item, index) => `${index + 1}. ${item.title}`).join("\n")}`;
     }
 }
@@ -1008,12 +1036,12 @@ async function summarizeNews(assetText = "") {
         return "Belum berhasil mengambil berita crypto terbaru. Coba lagi beberapa menit lagi.";
     }
 
-    if (!ai) {
+    if (!aiEnabled) {
         let text = `BERITA PASAR CRYPTO\nUpdate: ${nowText()}\n\n`;
         selected.slice(0, 5).forEach((item, index) => {
             text += `${index + 1}. ${item.title}\n${item.link}\n\n`;
         });
-        text += "Isi GEMINI_API_KEY untuk ringkasan dampak pasar otomatis.";
+        text += "Isi DEEPSEEK_API_KEY untuk ringkasan dampak pasar otomatis.";
         return text.trim();
     }
 
@@ -1030,14 +1058,10 @@ Berita:
 ${selected.map((item, index) => `${index + 1}. ${item.title}\n${item.description}\nSumber: ${item.source}\nLink: ${item.link}`).join("\n\n")}`;
 
     try {
-        const response = await ai.models.generateContent({
-            model: "gemini-2.5-flash",
-            contents: prompt
-        });
-        const text = response.text || response.candidates?.[0]?.content?.parts?.[0]?.text || "";
+        const text = await generateAiText(prompt, { maxTokens: 700 });
         return `ANALISIS BERITA CRYPTO\nUpdate: ${nowText()}\n\n${text.trim()}`;
     } catch (err) {
-        console.log("Gemini news error:", err.message);
+        console.log("DeepSeek news error:", err.message);
         return selected.map((item, index) => `${index + 1}. ${item.title}\n${item.link}`).join("\n\n");
     }
 }
@@ -1070,7 +1094,7 @@ Fitur:
 - monitor otomatis setiap ${MONITOR_INTERVAL_SECONDS} detik, rotasi 1 koin per siklus
 - laporan otomatis berbasis candle: trader ${timeframeLabel("trader")}, investor ${timeframeLabel("investor")}
 - alert otomatis saat sinyal kuat muncul
-- analisis berita internet via RSS dan Gemini
+- analisis berita internet via RSS dan DeepSeek
 - mode trader lebih agresif, mode investor lebih selektif
 
 Mode kamu sekarang: ${subscriberMode(jid).toUpperCase()}`;
