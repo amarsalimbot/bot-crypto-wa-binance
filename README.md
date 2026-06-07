@@ -31,7 +31,7 @@ Bot bisa menjawab harga realtime, membuat analisa teknikal, membaca berita crypt
 - Laporan berisi arah kemungkinan koin, teknikal, fundamental/news terbaru, dan catatan risiko.
 - Cooldown alert agar bot tidak spam.
 - Analisis berita crypto dari RSS internet.
-- Ringkasan dampak berita memakai Gemini jika `GEMINI_API_KEY` diisi.
+- Ringkasan dampak berita memakai DeepSeek jika `DEEPSEEK_API_KEY` diisi.
 - Keep-alive HTTP endpoint untuk Railway/Hugging Face.
 - Login WhatsApp memakai pairing code.
 
@@ -69,7 +69,9 @@ WHATSAPP_PHONE_NUMBER=6281234567890
 Variable opsional:
 
 ```text
-GEMINI_API_KEY=isi_api_key_gemini_anda
+DEEPSEEK_API_KEY=isi_api_key_deepseek_anda
+DEEPSEEK_MODEL=deepseek-chat
+DEEPSEEK_API_URL=https://api.deepseek.com/chat/completions
 APP_TIMEZONE=Asia/Makassar
 PORT=7860
 MARKET_DATA_PROVIDER=coingecko
@@ -94,7 +96,9 @@ COINGECKO_RATE_COOLDOWN_MINUTES=10
 Keterangan:
 
 - `WHATSAPP_PHONE_NUMBER` adalah nomor WhatsApp bot dalam format internasional tanpa tanda plus.
-- `GEMINI_API_KEY` dipakai untuk merangkum dampak berita. Tanpa ini, bot tetap jalan tetapi hanya menampilkan daftar berita.
+- `DEEPSEEK_API_KEY` dipakai untuk merangkum dampak berita. Tanpa ini, bot tetap jalan tetapi hanya menampilkan daftar berita.
+- `DEEPSEEK_MODEL` default `deepseek-chat`.
+- `DEEPSEEK_API_URL` default endpoint chat completion DeepSeek.
 - `MARKET_DATA_PROVIDER` bisa `coingecko`, `auto`, atau `binance`. Gunakan `coingecko` jika server terkena error Binance `451 restricted location`.
 - `MONITOR_INTERVAL_SECONDS` minimal 30 detik.
 - `SIGNAL_COOLDOWN_MINUTES` mencegah alert berulang untuk koin dan arah sinyal yang sama.
@@ -136,7 +140,7 @@ Project ini sudah memakai `Dockerfile`.
 
 ```bash
 docker build -t bot-crypto-wa .
-docker run --env WHATSAPP_PHONE_NUMBER=6281234567890 --env GEMINI_API_KEY=xxx -p 7860:7860 bot-crypto-wa
+docker run --env WHATSAPP_PHONE_NUMBER=6281234567890 --env DEEPSEEK_API_KEY=xxx -p 7860:7860 bot-crypto-wa
 ```
 
 ## Catatan Penting
