@@ -32,8 +32,10 @@ const INVESTOR_CANDLE_MINUTES = Math.max(15, Number(process.env.INVESTOR_CANDLE_
 const CANDLE_REPORT_DELAY_SECONDS = Math.max(5, Number(process.env.CANDLE_REPORT_DELAY_SECONDS || 20));
 const BINANCE_RESTRICTED_COOLDOWN_MINUTES = Math.max(30, Number(process.env.BINANCE_RESTRICTED_COOLDOWN_MINUTES || 360));
 const COINGECKO_RATE_COOLDOWN_MINUTES = Math.max(2, Number(process.env.COINGECKO_RATE_COOLDOWN_MINUTES || 10));
-const TICKER_CACHE_MS = Math.max(30_000, Number(process.env.TICKER_CACHE_SECONDS || 120) * 1000);
-const CANDLE_CACHE_MS = Math.max(5 * 60_000, Number(process.env.CANDLE_CACHE_MINUTES || 15) * 60_000);
+const TICKER_CACHE_MS = Math.max(10_000, Number(process.env.TICKER_CACHE_SECONDS || 20) * 1000);
+const CANDLE_CACHE_MS = Math.max(60_000, Number(process.env.CANDLE_CACHE_MINUTES || 2) * 60_000);
+const FORCE_REFRESH_ON_REQUEST = String(process.env.FORCE_REFRESH_ON_REQUEST || "true").toLowerCase() !== "false";
+const FORCE_REFRESH_DEDUP_MS = Math.max(5_000, Number(process.env.FORCE_REFRESH_DEDUP_SECONDS || 10) * 1000);
 const OWNER_JID = WHATSAPP_PHONE_NUMBER ? `${WHATSAPP_PHONE_NUMBER}@s.whatsapp.net` : "";
 const DATA_DIR = path.join(__dirname, "data");
 const STATE_FILE = path.join(DATA_DIR, "crypto-bot-state.json");
@@ -79,6 +81,11 @@ function tunggu(ms) {
 
 function nowText() {
     return new Date().toLocaleString("id-ID", { timeZone: APP_TIMEZONE });
+}
+
+function timeText(timestamp) {
+    if (!timestamp) return nowText();
+    return new Date(timestamp).toLocaleString("id-ID", { timeZone: APP_TIMEZONE });
 }
 
 function formatUsd(value, digits = 2) {
@@ -175,6 +182,23 @@ function setCache(key, data) {
     return data;
 }
 
+function deleteCache(key) {
+    memoryCache.market.delete(key);
+}
+
+function clearMarketCacheForSymbol(symbol) {
+    deleteCache(`ticker:${symbol}`);
+    for (const key of memoryCache.market.keys()) {
+        if (key.includes(symbol) || key.includes(findAssetBySymbol(symbol)?.coingeckoId || "__none__")) {
+            deleteCache(key);
+        }
+    }
+}
+
+function clearAllMarketCache() {
+    memoryCache.market.clear();
+}
+
 function markBinanceRestricted(err) {
     if (!isBinanceRestrictedError(err)) return;
     const baru = Date.now() + BINANCE_RESTRICTED_COOLDOWN_MINUTES * 60 * 1000;
@@ -244,7 +268,12 @@ async function fetchJson(url, timeoutMs = 15000) {
     try {
         const response = await fetch(url, {
             signal: controller.signal,
-            headers: { "User-Agent": "crypto-wa-bot/1.0" }
+            cache: "no-store",
+            headers: {
+                "User-Agent": "crypto-wa-bot/1.0",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache"
+            }
         });
         if (!response.ok) {
             const body = await response.text().catch(() => "");
@@ -262,7 +291,12 @@ async function fetchText(url, timeoutMs = 15000) {
     try {
         const response = await fetch(url, {
             signal: controller.signal,
-            headers: { "User-Agent": "crypto-wa-bot/1.0" }
+            cache: "no-store",
+            headers: {
+                "User-Agent": "crypto-wa-bot/1.0",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache"
+            }
         });
         if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
         return response.text();
@@ -271,9 +305,10 @@ async function fetchText(url, timeoutMs = 15000) {
     }
 }
 
-async function getTicker(symbol) {
+async function getTicker(symbol, options = {}) {
     const key = `ticker:${symbol}`;
-    const cached = getFreshCache(key, TICKER_CACHE_MS);
+    const force = Boolean(options.force);
+    const cached = force ? null : getFreshCache(key, TICKER_CACHE_MS);
     if (cached) return cached;
 
     let ticker;
@@ -283,6 +318,7 @@ async function getTicker(symbol) {
             ticker = {
                 symbol,
                 source: "Binance",
+                fetchedAt: Date.now(),
                 price: Number(data.lastPrice),
                 high: Number(data.highPrice),
                 low: Number(data.lowPrice),
@@ -299,7 +335,7 @@ async function getTicker(symbol) {
     }
 
     try {
-        ticker = await getCoinGeckoTicker(symbol);
+        ticker = await getCoinGeckoTicker(symbol, { force });
         return setCache(key, ticker);
     } catch (err) {
         markCoinGeckoRateLimited(err);
@@ -309,10 +345,12 @@ async function getTicker(symbol) {
     }
 }
 
-async function getKlines(symbol, interval = "15m", limit = 120) {
+async function getKlines(symbol, interval = "15m", limit = 120, options = {}) {
     const key = `klines:${symbol}:${interval}:${limit}`;
-    const cached = getFreshCache(key, CANDLE_CACHE_MS);
-    if (cached) return cached;
+    const force = Boolean(options.force);
+    const liveTicker = options.liveTicker || null;
+    const cached = force ? null : getFreshCache(key, CANDLE_CACHE_MS);
+    if (cached) return liveTicker ? mergeLiveTickerIntoCandles(cached, liveTicker, interval) : cached;
 
     let candles;
     if (bolehPakaiBinance()) {
@@ -328,6 +366,7 @@ async function getKlines(symbol, interval = "15m", limit = 120) {
                 closeTime: row[6],
                 source: "Binance"
             }));
+            candles = liveTicker ? mergeLiveTickerIntoCandles(candles, liveTicker, interval) : candles;
             return setCache(key, candles);
         } catch (err) {
             markBinanceRestricted(err);
@@ -337,13 +376,14 @@ async function getKlines(symbol, interval = "15m", limit = 120) {
     }
 
     try {
-        candles = await getCoinGeckoCandles(symbol, interval, limit);
+        candles = await getCoinGeckoCandles(symbol, interval, limit, { force });
+        candles = liveTicker ? mergeLiveTickerIntoCandles(candles, liveTicker, interval) : candles;
         return setCache(key, candles);
     } catch (err) {
         markCoinGeckoRateLimited(err);
         const stale = getStaleCache(key);
         if (stale) return stale;
-        const ticker = getStaleCache(`ticker:${symbol}`) || await getTicker(symbol);
+        const ticker = liveTicker || getStaleCache(`ticker:${symbol}`) || await getTicker(symbol);
         return buildSyntheticCandles(ticker.price, limit, interval);
     }
 }
@@ -377,9 +417,37 @@ function buildSyntheticCandles(price, limit = 120, interval = "15m") {
     });
 }
 
-async function getCoinGeckoBatchPrices() {
+function intervalToMs(interval) {
+    if (interval === "1h") return 60 * 60 * 1000;
+    if (interval === "15m") return 15 * 60 * 1000;
+    const match = String(interval).match(/^(\d+)(m|h)$/i);
+    if (!match) return 15 * 60 * 1000;
+    const value = Number(match[1]);
+    return match[2].toLowerCase() === "h" ? value * 60 * 60 * 1000 : value * 60 * 1000;
+}
+
+function mergeLiveTickerIntoCandles(candles, ticker, interval = "15m") {
+    if (!Array.isArray(candles) || !candles.length || !ticker?.price) return candles;
+
+    const updated = candles.map(candle => ({ ...candle }));
+    const last = updated[updated.length - 1];
+    const price = Number(ticker.price);
+    const frameMs = intervalToMs(interval);
+    const now = Date.now();
+
+    last.close = price;
+    last.high = Math.max(Number(last.high || price), price);
+    last.low = Math.min(Number(last.low || price), price);
+    last.closeTime = Math.max(Number(last.closeTime || 0), now);
+    last.openTime = Number(last.openTime || (now - frameMs));
+    last.source = `${last.source || ticker.source || "Market"}+Live`;
+
+    return updated;
+}
+
+async function getCoinGeckoBatchPrices(options = {}) {
     const key = "coingecko:batch-prices";
-    const cached = getFreshCache(key, TICKER_CACHE_MS);
+    const cached = options.force ? getFreshCache(key, FORCE_REFRESH_DEDUP_MS) : getFreshCache(key, TICKER_CACHE_MS);
     if (cached) return cached;
 
     ensureCoinGeckoAvailable();
@@ -389,11 +457,11 @@ async function getCoinGeckoBatchPrices() {
     return setCache(key, data);
 }
 
-async function getCoinGeckoTicker(symbol) {
+async function getCoinGeckoTicker(symbol, options = {}) {
     const item = findAssetBySymbol(symbol);
     if (!item?.coingeckoId) throw new Error(`Fallback CoinGecko tidak tersedia untuk ${symbol}`);
 
-    const data = await getCoinGeckoBatchPrices();
+    const data = await getCoinGeckoBatchPrices(options);
     const row = data[item.coingeckoId];
     if (!row?.usd) throw new Error(`CoinGecko tidak mengembalikan harga ${item.asset}`);
 
@@ -401,6 +469,7 @@ async function getCoinGeckoTicker(symbol) {
     return {
         symbol,
         source: "CoinGecko",
+        fetchedAt: Date.now(),
         price,
         high: price,
         low: price,
@@ -410,14 +479,14 @@ async function getCoinGeckoTicker(symbol) {
     };
 }
 
-async function getCoinGeckoCandles(symbol, interval, limit) {
+async function getCoinGeckoCandles(symbol, interval, limit, options = {}) {
     const item = findAssetBySymbol(symbol);
     if (!item?.coingeckoId) throw new Error(`Fallback CoinGecko tidak tersedia untuk ${symbol}`);
 
     ensureCoinGeckoAvailable();
 
     const sharedKey = `coingecko:ohlc:${symbol}:1`;
-    const cachedRows = getFreshCache(sharedKey, CANDLE_CACHE_MS);
+    const cachedRows = options.force ? null : getFreshCache(sharedKey, CANDLE_CACHE_MS);
     const rows = cachedRows || setCache(sharedKey, await fetchJson(`https://api.coingecko.com/api/v3/coins/${item.coingeckoId}/ohlc?vs_currency=usd&days=1`));
     if (!Array.isArray(rows) || rows.length < 30) throw new Error(`CoinGecko candle ${item.asset} kurang data`);
 
@@ -633,15 +702,16 @@ function scoreSignal({ ticker, candles15m, candles1h, mode }) {
     };
 }
 
-async function analyzeAsset(asset, mode = DEFAULT_MODE) {
+async function analyzeAsset(asset, mode = DEFAULT_MODE, options = {}) {
     const item = typeof asset === "string" ? normalizeAsset(asset) : asset;
     if (!item) throw new Error("Koin tidak ada di watchlist.");
 
-    const ticker = await getTicker(item.symbol);
+    const force = options.force ?? FORCE_REFRESH_ON_REQUEST;
+    const ticker = await getTicker(item.symbol, { force });
     await sleep(250);
-    const candles15m = await getKlines(item.symbol, "15m", 150);
+    const candles15m = await getKlines(item.symbol, "15m", 150, { force: false, liveTicker: ticker });
     await sleep(250);
-    const candles1h = await getKlines(item.symbol, "1h", 120);
+    const candles1h = await getKlines(item.symbol, "1h", 120, { force: false, liveTicker: ticker });
 
     return {
         ...item,
@@ -651,11 +721,12 @@ async function analyzeAsset(asset, mode = DEFAULT_MODE) {
     };
 }
 
-async function getAllPrices() {
+async function getAllPrices(options = {}) {
     const results = [];
+    const force = options.force ?? FORCE_REFRESH_ON_REQUEST;
     for (const item of WATCHLIST) {
         try {
-            results.push({ ...item, ticker: await getTicker(item.symbol) });
+            results.push({ ...item, ticker: await getTicker(item.symbol, { force }) });
         } catch (err) {
             results.push({ ...item, error: err.message });
         }
@@ -674,6 +745,7 @@ function buildPriceMessage(rows) {
         const digits = row.ticker.price >= 100 ? 2 : 4;
         text += `💠 *${row.asset}/USDT*: ${formatUsd(row.ticker.price, digits)} (${formatPct(row.ticker.changePct)} 24j)\n`;
         text += `📡 Sumber: ${row.ticker.source || "Market API"}\n`;
+        text += `🔄 Data: ${timeText(row.ticker.fetchedAt)}\n`;
         text += `📈 High/Low: ${formatUsd(row.ticker.high, digits)} / ${formatUsd(row.ticker.low, digits)}\n\n`;
     }
     text += "Ketik: analisa BTC, analisa ETH investor, berita, alert on.";
@@ -737,6 +809,7 @@ function buildAnalysisMessage(result) {
     return `${asset} (${name}) - ${mode.toUpperCase()}
 Harga: ${formatUsd(ticker.price, digits)} (${formatPct(ticker.changePct)} 24j)
 Sumber data: ${ticker.source || "Binance"}
+Data harga: ${timeText(ticker.fetchedAt)}
 Sinyal: ${label}
 Confidence: ${signal.score}/100
 Entry score: ${signal.entryScore}/100
@@ -816,12 +889,13 @@ ${selected.map((item, index) => `${index + 1}. ${item.title}\n${item.description
     }
 }
 
-async function buildAutoMarketReport(mode = DEFAULT_MODE) {
+async function buildAutoMarketReport(mode = DEFAULT_MODE, options = {}) {
     const analyses = [];
+    const force = options.force ?? true;
 
     for (const item of WATCHLIST) {
         try {
-            analyses.push(await analyzeAsset(item, mode));
+            analyses.push(await analyzeAsset(item, mode, { force }));
         } catch (err) {
             analyses.push({ ...item, error: pendekkanError(err.message) });
         }
@@ -846,6 +920,7 @@ async function buildAutoMarketReport(mode = DEFAULT_MODE) {
         const { signal } = row;
         const plan = buildTradePlan(row);
         text += `\n${signalEmoji(signal.action)} *${row.asset}* ${formatUsd(row.ticker.price, digits)} (${formatPct(row.ticker.changePct)})`;
+        text += `\n   🔄 Data: ${timeText(row.ticker.fetchedAt)} | ${row.ticker.source || "Market API"}`;
         text += `\n   Arah: *${directionText(signal)}*`;
         text += `\n   Sinyal: *${signal.action}* | Confidence ${signal.score}/100`;
         text += `\n   🎯 Entry: ${plan.entry}`;
@@ -986,6 +1061,7 @@ Perintah utama:
 - alert off
 - mode trader
 - mode investor
+- refresh
 - status
 
 Fitur:
@@ -1299,6 +1375,12 @@ async function handleMessage(sock, msg) {
             return sock.sendMessage(from, { text: `Mode diubah ke ${mode.toUpperCase()}. Alert otomatis juga aktif untuk nomor ini.` });
         }
 
+        if (/^(refresh|refresh data|update data|muat ulang)$/i.test(lower)) {
+            clearAllMarketCache();
+            coingeckoRateLimitedUntil = 0;
+            return sock.sendMessage(from, { text: "🔄 Cache market sudah dikosongkan. Data harga berikutnya akan diambil ulang dari provider realtime." });
+        }
+
         if (/^(status|cek status)$/i.test(lower)) {
             const active = state.subscribers[from]?.active ? "AKTIF" : "OFF";
             return sock.sendMessage(from, {
@@ -1315,6 +1397,9 @@ Candle investor: ${timeframeLabel("investor")}
 Cooldown alert: ${SIGNAL_COOLDOWN_MINUTES} menit
 Binance: ${cooldownText(binanceBlockedUntil)}
 CoinGecko: ${cooldownText(coingeckoRateLimitedUntil)}
+Refresh harga: ${FORCE_REFRESH_ON_REQUEST ? "force realtime aktif" : "cache normal"}
+Cache ticker: ${Math.round(TICKER_CACHE_MS / 1000)} detik
+Cache candle: ${Math.round(CANDLE_CACHE_MS / 60000)} menit + live price
 Update: ${nowText()}`
             });
         }
@@ -1322,12 +1407,13 @@ Update: ${nowText()}`
         if (/^(harga|price|cek harga|daftar harga)\b/i.test(lower)) {
             const asset = normalizeAsset(pesan);
             if (asset) {
-                const ticker = await getTicker(asset.symbol);
+                const ticker = await getTicker(asset.symbol, { force: FORCE_REFRESH_ON_REQUEST });
                 const digits = ticker.price >= 100 ? 2 : 4;
                 return sock.sendMessage(from, {
                     text: `${asset.asset}/USDT realtime
 Harga: ${formatUsd(ticker.price, digits)}
 Sumber: ${ticker.source || "Binance"}
+Data harga: ${timeText(ticker.fetchedAt)}
 24j: ${formatPct(ticker.changePct)}
 High: ${formatUsd(ticker.high, digits)}
 Low: ${formatUsd(ticker.low, digits)}
@@ -1335,7 +1421,7 @@ Volume quote: ${formatUsd(ticker.quoteVolume, 0)}
 Update: ${nowText()}`
                 });
             }
-            return sock.sendMessage(from, { text: buildPriceMessage(await getAllPrices()) });
+            return sock.sendMessage(from, { text: buildPriceMessage(await getAllPrices({ force: FORCE_REFRESH_ON_REQUEST })) });
         }
 
         if (/^(analisa|analisis|signal|sinyal|entry|sell)\b/i.test(lower)) {
