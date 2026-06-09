@@ -1,3 +1,0 @@
-{
-  "postStartCommand": "pkill -f 'node wa.js' || true; npm ci && nohup npm start > bot.log 2>&1 &"
-}
