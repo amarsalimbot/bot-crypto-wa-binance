@@ -97,6 +97,10 @@ COINGECKO_API_KEY=isi_api_key_coingecko_anda
 COINGECKO_API_TYPE=demo
 APP_TIMEZONE=Asia/Makassar
 PORT=7860
+FORCE_NEW_LOGIN=false
+AUTO_CLEAR_LOGGED_OUT_SESSION=true
+PAIRING_CODE_DELAY_SECONDS=8
+PAIRING_CODE_RETRY=3
 MONITOR_INTERVAL_SECONDS=60
 SIGNAL_COOLDOWN_MINUTES=45
 DEFAULT_MODE=trader
@@ -119,6 +123,10 @@ COINGECKO_RATE_COOLDOWN_MINUTES=10
 Keterangan:
 
 - `WHATSAPP_PHONE_NUMBER` adalah nomor WhatsApp bot dalam format internasional tanpa tanda plus.
+- `FORCE_NEW_LOGIN=true` menghapus session WhatsApp lama saat bot start dan memaksa bot meminta pairing code baru.
+- `AUTO_CLEAR_LOGGED_OUT_SESSION=true` membuat bot otomatis menghapus session yang sudah logout lalu meminta login ulang.
+- `PAIRING_CODE_DELAY_SECONDS` memberi jeda sebelum bot meminta pairing code agar socket WhatsApp siap.
+- `PAIRING_CODE_RETRY` menentukan jumlah percobaan meminta pairing code.
 - `OPENAI_API_KEY` mengaktifkan ChatGPT sebagai AI prioritas pertama.
 - `OPENAI_MODEL` mengatur model OpenAI. Default `gpt-5.4-mini` agar respons cepat dan biaya lebih ringan.
 - `GEMINI_API_KEY` mengaktifkan Gemini sebagai fallback otomatis jika OpenAI tidak merespons.
@@ -210,6 +218,19 @@ Saat pertama kali jalan, bot akan menampilkan pairing code di log terminal. Masu
 3. Pilih Tautkan perangkat.
 4. Pilih Tautkan dengan nomor telepon.
 5. Masukkan kode dari terminal.
+
+## Login Ulang WhatsApp
+
+Jika bot tidak menampilkan kode login atau tidak meminta pairing code:
+
+1. Pastikan `WHATSAPP_PHONE_NUMBER` sudah diisi, contoh `6281234567890`.
+2. Set `FORCE_NEW_LOGIN=true`.
+3. Deploy/restart bot.
+4. Buka log deploy, cari baris `KODE MASUK WHATSAPP`.
+5. Masukkan kode itu di WhatsApp melalui menu Perangkat tertaut.
+6. Setelah berhasil login, Anda boleh ubah `FORCE_NEW_LOGIN=false` agar session tidak dihapus pada restart berikutnya.
+
+Jangan hapus `WHATSAPP_PHONE_NUMBER`. Pairing code hanya muncul di log bot, bukan dikirim sebagai pesan WhatsApp.
 
 ## Deploy Docker
 
