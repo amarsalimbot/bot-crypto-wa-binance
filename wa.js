@@ -14,6 +14,10 @@ const path = require("path");
 const APP_TIMEZONE = process.env.APP_TIMEZONE || "Asia/Makassar";
 const PORT = Number(process.env.PORT || 7860);
 const WHATSAPP_PHONE_NUMBER = String(process.env.WHATSAPP_PHONE_NUMBER || "").replace(/\D/g, "");
+const FORCE_NEW_LOGIN = String(process.env.FORCE_NEW_LOGIN || process.env.FORCE_PAIRING_CODE || "false").toLowerCase() === "true";
+const AUTO_CLEAR_LOGGED_OUT_SESSION = String(process.env.AUTO_CLEAR_LOGGED_OUT_SESSION || "true").toLowerCase() !== "false";
+const PAIRING_CODE_DELAY_SECONDS = Math.max(3, Number(process.env.PAIRING_CODE_DELAY_SECONDS || 8));
+const PAIRING_CODE_RETRY = Math.max(1, Math.min(5, Number(process.env.PAIRING_CODE_RETRY || 3)));
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.4-mini";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
@@ -56,6 +60,7 @@ const FORCE_REFRESH_DEDUP_MS = Math.max(5_000, Number(process.env.FORCE_REFRESH_
 const OWNER_JID = WHATSAPP_PHONE_NUMBER ? `${WHATSAPP_PHONE_NUMBER}@s.whatsapp.net` : "";
 const DATA_DIR = path.join(__dirname, "data");
 const STATE_FILE = path.join(DATA_DIR, "crypto-bot-state.json");
+const SESSION_DIR = path.join(__dirname, "session");
 
 const WATCHLIST = [
     { asset: "PAXG", symbol: "PAXGUSDT", name: "PAX Gold", coingeckoId: "pax-gold" },
@@ -404,6 +409,28 @@ function clearMarketCacheForSymbol(symbol) {
 
 function clearAllMarketCache() {
     memoryCache.market.clear();
+}
+
+function removeSessionFolder(reason = "login ulang") {
+    try {
+        if (!fs.existsSync(SESSION_DIR)) return false;
+        fs.rmSync(SESSION_DIR, { recursive: true, force: true });
+        console.log(`Folder session WhatsApp dihapus untuk ${reason}.`);
+        return true;
+    } catch (err) {
+        console.log(`Gagal menghapus folder session: ${err.message}`);
+        return false;
+    }
+}
+
+function authNeedsPairing(authState) {
+    return FORCE_NEW_LOGIN || !authState?.creds?.registered || !authState?.creds?.me?.id;
+}
+
+function logAuthStatus(authState) {
+    const registered = Boolean(authState?.creds?.registered);
+    const me = authState?.creds?.me?.id || "-";
+    console.log(`Session WhatsApp: registered=${registered}, me=${me}`);
 }
 
 function markBinanceUnavailable(err, symbol = "") {
@@ -1714,6 +1741,30 @@ async function ambilNomorWhatsApp() {
     return WHATSAPP_PHONE_NUMBER;
 }
 
+async function requestPairingCodeWithRetry(sock, nomorWhatsApp) {
+    for (let attempt = 1; attempt <= PAIRING_CODE_RETRY; attempt++) {
+        try {
+            console.log(`Meminta pairing code WhatsApp percobaan ${attempt}/${PAIRING_CODE_RETRY}...`);
+            const kodeLogin = await sock.requestPairingCode(nomorWhatsApp);
+            const kodeRapi = String(kodeLogin).match(/.{1,4}/g)?.join("-") || kodeLogin;
+            console.log("========================================");
+            console.log(`KODE MASUK WHATSAPP: ${kodeRapi}`);
+            console.log("========================================");
+            console.log("Cara pakai:");
+            console.log("1. Buka WhatsApp di HP");
+            console.log("2. Masuk ke Perangkat tertaut");
+            console.log("3. Pilih Tautkan perangkat");
+            console.log("4. Pilih Tautkan dengan nomor telepon");
+            console.log("5. Masukkan kode di atas");
+            return kodeRapi;
+        } catch (err) {
+            console.log(`Gagal meminta pairing code percobaan ${attempt}: ${err.message || err}`);
+            if (attempt >= PAIRING_CODE_RETRY) throw err;
+            await tunggu(5000);
+        }
+    }
+}
+
 function unwrapMessageContent(message) {
     let content = message || {};
     for (let depth = 0; depth < 5; depth++) {
@@ -1950,10 +2001,18 @@ async function startBot() {
     try {
         console.log("Memulai Bot Analisa Crypto Binance...");
         console.log("Metode login WhatsApp: pairing code.");
+        console.log(`Nomor WA target: ${WHATSAPP_PHONE_NUMBER ? WHATSAPP_PHONE_NUMBER : "BELUM DIISI"}`);
+        console.log(`Force login baru: ${FORCE_NEW_LOGIN ? "YA" : "tidak"}`);
 
         cleanupSocket();
 
-        const { state: authState, saveCreds } = await useMultiFileAuthState("./session");
+        if (FORCE_NEW_LOGIN) {
+            removeSessionFolder("FORCE_NEW_LOGIN=true");
+        }
+
+        const { state: authState, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+        logAuthStatus(authState);
+        const perluPairing = authNeedsPairing(authState);
         const { version } = await fetchLatestBaileysVersion();
 
         const sock = makeWASocket({
@@ -2003,7 +2062,12 @@ async function startBot() {
                 cleanupSocket();
 
                 if (statusCode === DisconnectReason.loggedOut) {
-                    console.log("WhatsApp logout. Hapus folder session lalu deploy ulang untuk login lagi.");
+                    console.log("WhatsApp logout. Session lama tidak valid.");
+                    if (AUTO_CLEAR_LOGGED_OUT_SESSION) {
+                        removeSessionFolder("WhatsApp loggedOut");
+                        return jadwalkanReconnect("login ulang WhatsApp", 5000);
+                    }
+                    console.log("AUTO_CLEAR_LOGGED_OUT_SESSION=false. Hapus folder session manual lalu deploy ulang untuk login lagi.");
                     return;
                 }
                 if (statusCode === 440 || alasanLower.includes("conflict")) return jadwalkanReconnect("conflict session WhatsApp", 60000);
@@ -2023,27 +2087,15 @@ async function startBot() {
             }
         });
 
-        if (!sock.authState.creds.registered) {
+        if (perluPairing) {
             const nomorWhatsApp = await ambilNomorWhatsApp();
 
-            console.log("Menunggu koneksi siap sebelum meminta kode...");
-            await tunggu(5000);
-
-            console.log("Meminta kode masuk WhatsApp...");
-            console.log(`Nomor WhatsApp: ${nomorWhatsApp}`);
+            console.log(`Session belum login. Pairing code akan diminta ke nomor ${nomorWhatsApp}.`);
+            console.log(`Menunggu ${PAIRING_CODE_DELAY_SECONDS} detik agar socket siap sebelum meminta kode...`);
+            await tunggu(PAIRING_CODE_DELAY_SECONDS * 1000);
 
             try {
-                const kodeLogin = await sock.requestPairingCode(nomorWhatsApp);
-                const kodeRapi = String(kodeLogin).match(/.{1,4}/g)?.join("-") || kodeLogin;
-                console.log("========================================");
-                console.log(`KODE MASUK WHATSAPP: ${kodeRapi}`);
-                console.log("========================================");
-                console.log("Cara pakai:");
-                console.log("1. Buka WhatsApp di HP");
-                console.log("2. Masuk ke Perangkat tertaut");
-                console.log("3. Pilih Tautkan perangkat");
-                console.log("4. Pilih Tautkan dengan nomor telepon");
-                console.log("5. Masukkan kode di atas");
+                await requestPairingCodeWithRetry(sock, nomorWhatsApp);
             } catch (err) {
                 console.log("Gagal meminta kode masuk:", err.message || err);
                 sedangStart = false;
@@ -2052,7 +2104,8 @@ async function startBot() {
                 return;
             }
         } else {
-            console.log("Session WhatsApp sudah terdaftar. Tidak perlu kode masuk lagi.");
+            console.log("Session WhatsApp sudah terdaftar lengkap. Tidak meminta pairing code baru.");
+            console.log("Jika tetap perlu login ulang, set FORCE_NEW_LOGIN=true lalu restart/deploy ulang.");
         }
 
         sedangStart = false;
